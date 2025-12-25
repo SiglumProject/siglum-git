@@ -542,7 +542,21 @@ export class GitService {
 
     try {
       const { git } = await loadGitModules()
-      await git.add({ fs: this.fs, dir: GIT_DIR, filepath: '.' })
+
+      // Stage all changes including deletions
+      const statusMatrix = await git.statusMatrix({ fs: this.fs, dir: GIT_DIR })
+      for (const [filepath, _head, workdir, stage] of statusMatrix) {
+        if (filepath.startsWith('.git')) continue
+        if (workdir !== stage) {
+          if (workdir === 0) {
+            // File was deleted - stage the deletion
+            await git.remove({ fs: this.fs, dir: GIT_DIR, filepath })
+          } else {
+            // File was added or modified
+            await git.add({ fs: this.fs, dir: GIT_DIR, filepath })
+          }
+        }
+      }
 
       await git.commit({
         fs: this.fs,
