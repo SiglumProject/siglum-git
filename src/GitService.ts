@@ -610,6 +610,7 @@ export class GitService {
         fs: this.fs,
         http,
         dir: GIT_DIR,
+        url: this.config.repoUrl,
         remote: 'origin',
         ref: this.config.branch,
         singleBranch: true,
