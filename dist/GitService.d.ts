@@ -33,6 +33,9 @@ export declare class GitService {
     private options;
     constructor(options?: GitServiceOptions);
     private loadConfig;
+    private recordRemoteError;
+    /** Validate new credentials without cloning or replacing any local files. */
+    updateToken(token: string): Promise<void>;
     private saveConfig;
     private notifyStatusListeners;
     private notifyFileTreeListeners;
@@ -83,10 +86,12 @@ export declare class GitService {
     /**
      * Pull changes from remote
      */
+    private pullRemote;
     pull(): Promise<void>;
     /**
      * Push changes to remote
      */
+    private pushRemote;
     push(): Promise<void>;
     /**
      * Commit changes

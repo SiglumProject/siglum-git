@@ -67,6 +67,7 @@ export class GitService {
   private fs: FilesystemGitAdapter
   private config: GitConfig | null = null
   private status: GitStatus = {
+    remoteStatus: 'unchecked',
     isConnected: false,
     isSyncing: false,
     ahead: 0,
@@ -112,6 +113,39 @@ export class GitService {
       } catch {
         // Invalid config
       }
+    }
+  }
+
+  private recordRemoteError(error: unknown): void {
+    const code = (error as { data?: { statusCode?: number } })?.data?.statusCode
+    const message = error instanceof Error ? error.message : 'Could not sync with the repository.'
+    this.status.needsAuthentication = code === 401 || code === 403 || /\b(401|403)\b/.test(message)
+    this.status.remoteStatus = 'error'
+    this.status.error = this.status.needsAuthentication
+      ? 'Repository access was denied. Update your token and check that it has access to this repository. Local files are still available.'
+      : message
+    this.notifyStatusListeners()
+  }
+
+  /** Validate new credentials without cloning or replacing any local files. */
+  async updateToken(token: string): Promise<void> {
+    if (!this.config) throw new Error('Not configured')
+    if (this.status.isSyncing) throw new Error('Another Git operation is in progress')
+    if (!token.trim()) throw new Error('Enter a token')
+    const previous = this.config
+    this.config = { ...previous, token: token.trim() }
+    this.status.isSyncing = true
+    this.notifyStatusListeners()
+    try {
+      await this.checkRemote()
+      this.saveConfig()
+      this.startAutoSync()
+    } catch (error) {
+      this.config = previous
+      throw error
+    } finally {
+      this.status.isSyncing = false
+      this.notifyStatusListeners()
     }
   }
 
@@ -220,7 +254,7 @@ export class GitService {
       await this.cloneReplacement(config, 1)
       this.config = { ...config }
       this.status = {
-        isConnected: true, isSyncing: true, ahead: 0, behind: 0,
+        isConnected: true, remoteStatus: 'ok', isSyncing: true, ahead: 0, behind: 0,
         hasChanges: false, hasConflict: false, lastSync: new Date(),
       }
       this.saveConfig()
@@ -455,6 +489,30 @@ export class GitService {
   /**
    * Pull changes from remote
    */
+  private async pullRemote(): Promise<void> {
+    if (!this.config) throw new Error('Not configured')
+    await this.ensureMounted()
+    const { git, http } = await loadGitModules()
+    await git.pull({
+      fs: this.fs,
+      http,
+      dir: GIT_DIR,
+      url: this.getRepoUrl(),
+      corsProxy: this.options.corsProxy,
+      ref: this.config.branch,
+      singleBranch: true,
+      author: {
+        name: this.config.username || 'Siglum User',
+        email: `${this.config.username || 'user'}@siglum.app`
+      },
+      onAuth: () => ({
+        username: this.config!.username || this.config!.token,
+        password: this.config!.token
+      })
+    })
+
+  }
+
   async pull(): Promise<void> {
     if (!this.config) throw new Error('Not configured')
 
@@ -464,23 +522,7 @@ export class GitService {
     this.notifyStatusListeners()
 
     try {
-      await this.ensureMounted()
-      const { git, http } = await loadGitModules()
-      await git.pull({
-        fs: this.fs,
-        http,
-        dir: GIT_DIR,
-        ref: this.config.branch,
-        singleBranch: true,
-        author: {
-          name: this.config.username || 'Siglum User',
-          email: `${this.config.username || 'user'}@siglum.app`
-        },
-        onAuth: () => ({
-          username: this.config!.username || this.config!.token,
-          password: this.config!.token
-        })
-      })
+      await this.pullRemote()
 
       this.status.lastSync = new Date()
       this.status.behind = 0
@@ -496,6 +538,26 @@ export class GitService {
   /**
    * Push changes to remote
    */
+  private async pushRemote(): Promise<void> {
+    if (!this.config) throw new Error('Not configured')
+    await this.ensureMounted()
+    const { git, http } = await loadGitModules()
+    await git.push({
+      fs: this.fs,
+      http,
+      dir: GIT_DIR,
+      url: this.getRepoUrl(),
+      corsProxy: this.options.corsProxy,
+      remote: 'origin',
+      ref: this.config.branch,
+      onAuth: () => ({
+        username: this.config!.username || this.config!.token,
+        password: this.config!.token
+      })
+    })
+
+  }
+
   async push(): Promise<void> {
     if (!this.config) throw new Error('Not configured')
 
@@ -504,19 +566,7 @@ export class GitService {
     this.notifyStatusListeners()
 
     try {
-      await this.ensureMounted()
-      const { git, http } = await loadGitModules()
-      await git.push({
-        fs: this.fs,
-        http,
-        dir: GIT_DIR,
-        remote: 'origin',
-        ref: this.config.branch,
-        onAuth: () => ({
-          username: this.config!.username || this.config!.token,
-          password: this.config!.token
-        })
-      })
+      await this.pushRemote()
 
       this.status.lastSync = new Date()
       this.status.ahead = 0
@@ -577,41 +627,37 @@ export class GitService {
    * Get list of changed files
    */
   async getChanges(): Promise<FileChange[]> {
-    try {
-      await this.ensureMounted()
-      const { git } = await loadGitModules()
-      const statusMatrix = await git.statusMatrix({ fs: this.fs, dir: GIT_DIR })
-      const changes: FileChange[] = []
+    await this.ensureMounted()
+    const { git } = await loadGitModules()
+    const statusMatrix = await git.statusMatrix({ fs: this.fs, dir: GIT_DIR })
+    const changes: FileChange[] = []
 
-      for (const [filepath, head, workdir, stage] of statusMatrix) {
-        if (filepath.startsWith('.git')) continue
+    for (const [filepath, head, workdir, stage] of statusMatrix) {
+      if (filepath.startsWith('.git')) continue
 
-        // Status values: 0=absent, 1=same as HEAD, 2=different from HEAD
-        if (head === 0 && workdir === 2 && stage === 0) {
-          changes.push({ path: filepath, status: 'untracked' })
-        } else if (head === 0 && workdir === 2 && stage === 2) {
-          changes.push({ path: filepath, status: 'added' })
-        } else if (head === 1 && workdir === 2 && stage === 1) {
-          changes.push({ path: filepath, status: 'modified' })
-        } else if (head === 1 && workdir === 0 && stage === 0) {
-          changes.push({ path: filepath, status: 'deleted' })
-        }
+      // Status values: 0=absent, 1=same as HEAD, 2=different from HEAD
+      if (head === 0 && workdir === 2 && stage === 0) {
+        changes.push({ path: filepath, status: 'untracked' })
+      } else if (head === 0 && workdir === 2 && stage === 2) {
+        changes.push({ path: filepath, status: 'added' })
+      } else if (head === 1 && workdir === 2 && stage === 1) {
+        changes.push({ path: filepath, status: 'modified' })
+      } else if (head === 1 && workdir === 0 && stage === 0) {
+        changes.push({ path: filepath, status: 'deleted' })
       }
-
-      this.status.hasChanges = changes.length > 0
-      this.notifyStatusListeners()
-
-      return changes
-    } catch {
-      return []
     }
+
+    this.status.hasChanges = changes.length > 0
+    this.notifyStatusListeners()
+
+    return changes
   }
 
   /**
    * Check for remote changes
    */
   async checkRemote(): Promise<{ hasRemoteChanges: boolean; hasLocalChanges: boolean }> {
-    if (!this.config) return { hasRemoteChanges: false, hasLocalChanges: false }
+    if (!this.config) throw new Error('Not configured')
 
     try {
       await this.ensureMounted()
@@ -639,13 +685,16 @@ export class GitService {
       const hasRemoteChanges = localHead !== remoteHead
       const hasLocalChanges = localChanges.length > 0
 
+      this.status.remoteStatus = 'ok'
+      this.status.needsAuthentication = false
+      this.status.error = undefined
       this.status.hasConflict = hasRemoteChanges && hasLocalChanges
       this.notifyStatusListeners()
 
       return { hasRemoteChanges, hasLocalChanges }
     } catch (error) {
-      console.error('[GitService] checkRemote failed:', error)
-      return { hasRemoteChanges: false, hasLocalChanges: false }
+      this.recordRemoteError(error)
+      throw error
     }
   }
 
@@ -656,12 +705,10 @@ export class GitService {
   async sync(): Promise<{ pulledFiles?: string[], hasConflict?: boolean, conflictingFiles?: ConflictingFile[] }> {
     console.log('[GitService] sync() called')
     if (!this.config) {
-      console.log('[GitService] sync() - no config, returning')
-      return {}
+      throw new Error('Not configured')
     }
     if (this.status.isSyncing) {
-      console.log('[GitService] sync() - already syncing, returning')
-      return {}
+      throw new Error('Another Git operation is in progress')
     }
 
     this.status.isSyncing = true
@@ -731,15 +778,17 @@ export class GitService {
         }
 
         // Pull remote changes (this will merge with our commit)
-        await this.pull()
+        await this.pullRemote()
         await this.syncFileTree()
 
         // Push merged result (our changes + pulled changes)
-        await this.push()
+        await this.pushRemote()
 
         this.status.hasConflict = false
         this.status.conflictingFiles = undefined
         this.status.conflictSource = undefined
+        this.status.ahead = 0
+        this.status.behind = 0
         this.status.lastSync = new Date()
 
         return { pulledFiles: remoteChangedFiles }
@@ -750,11 +799,11 @@ export class GitService {
         console.log('[GitService] sync() - committing local changes')
         await this.commitAllChanges('Auto-save from Siglum')
         console.log('[GitService] sync() - pushing')
-        await this.push()
+        await this.pushRemote()
         console.log('[GitService] sync() - push complete')
       } else if (this.status.ahead > 0) {
         console.log('[GitService] sync() - no local changes but ahead, pushing')
-        await this.push()
+        await this.pushRemote()
       } else {
         console.log('[GitService] sync() - nothing to do')
       }
@@ -762,12 +811,13 @@ export class GitService {
       this.status.hasConflict = false
       this.status.conflictingFiles = undefined
       this.status.conflictSource = undefined
+      this.status.ahead = 0
+      this.status.behind = 0
       this.status.lastSync = new Date()
       return {}
     } catch (error) {
-      console.error('[GitService] sync() error:', error)
-      this.status.error = error instanceof Error ? error.message : 'Sync failed'
-      return {}
+      this.recordRemoteError(error)
+      throw error
     } finally {
       this.status.isSyncing = false
       this.notifyStatusListeners()
@@ -1062,7 +1112,11 @@ export class GitService {
 
     const interval = intervals[this.config.syncInterval]
     if (interval && typeof window !== 'undefined') {
-      this.syncIntervalId = window.setInterval(() => this.sync(), interval)
+      this.syncIntervalId = window.setInterval(() => {
+        if (!this.status.needsAuthentication && !this.status.isSyncing) {
+          void this.sync().catch(() => { /* Failure is exposed through status. */ })
+        }
+      }, interval)
     }
   }
 
@@ -1101,7 +1155,7 @@ export class GitService {
   }
 
   private async checkRemoteQuietly(): Promise<void> {
-    if (!this.config || this.status.isSyncing) return
+    if (!this.config || this.status.isSyncing || this.status.needsAuthentication) return
 
     try {
       const { hasRemoteChanges, hasLocalChanges } = await this.checkRemote()
@@ -1122,7 +1176,7 @@ export class GitService {
         this.notifyStatusListeners()
       }
     } catch {
-      // Silently ignore errors during background check
+      // checkRemote/sync publish the failure; avoid an unhandled background rejection.
     }
   }
 

@@ -22,6 +22,10 @@ export interface GitConfig {
 export interface GitStatus {
     /** Whether connected to a repository */
     isConnected: boolean;
+    /** Remote access verified in this session; a linked repository can remain usable offline. */
+    remoteStatus?: 'unchecked' | 'ok' | 'error';
+    /** Background retries pause until credentials are updated or the user retries. */
+    needsAuthentication?: boolean;
     /** Whether currently syncing */
     isSyncing: boolean;
     /** Last sync timestamp */
