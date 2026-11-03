@@ -236,3 +236,115 @@ test('starting collaboration refuses unsynced work without recloning', async () 
   expect(await fileSystem.readFile('/git/draft.tex')).toBe('local draft')
   expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(oid)
 })
+
+for (const code of [401, 403, 500]) {
+  test(`remote HTTP ${code} cannot become a successful sync`, async () => {
+    const { service } = await branchFixture()
+    const lastSync = new Date('2026-01-01T00:00:00Z')
+    Object.assign((service as any).status, { isConnected: true, lastSync })
+    const failure = Object.assign(new Error(`HTTP Error: ${code}`), { data: { statusCode: code } })
+    const fetch = spyOn(git, 'fetch').mockRejectedValue(failure)
+    const push = spyOn(git, 'push').mockResolvedValue({ ok: true })
+    try {
+      await expect(service.sync()).rejects.toThrow(`HTTP Error: ${code}`)
+      expect(service.getStatus()).toMatchObject({
+        isConnected: true, isSyncing: false, lastSync, remoteStatus: 'error',
+        needsAuthentication: code !== 500,
+      })
+      expect(service.getStatus().error).toContain(code === 500 ? '500' : 'Update your token')
+      expect(push).not.toHaveBeenCalled()
+      expect(await adapter.promises.readFile('/repo/main.tex', 'utf8')).toBe('original')
+      if (code !== 500) {
+        await (service as any).checkRemoteQuietly()
+        expect(fetch).toHaveBeenCalledTimes(1)
+        await expect(service.sync()).rejects.toThrow() // Explicit retry is still available.
+        expect(fetch).toHaveBeenCalledTimes(2)
+      }
+    } finally { fetch.mockRestore(); push.mockRestore() }
+  })
+}
+
+test('token replacement verifies access without replacing local files or claiming a sync', async () => {
+  const { service, oid } = await branchFixture()
+  await git.writeRef({ fs: adapter, dir, ref: 'refs/remotes/origin/main', value: oid })
+  await adapter.promises.writeFile('/repo/main.tex', 'unsynced draft')
+  Object.assign((service as any).status, { isConnected: true, needsAuthentication: true, error: 'Denied', remoteStatus: 'error' })
+  const fetch = spyOn(git, 'fetch').mockImplementation(async (options: any) => {
+    expect(options.onAuth().password).toBe('replacement-token')
+    return {} as any
+  })
+  try {
+    await service.updateToken(' replacement-token ')
+    expect(service.getConfig()?.token).toBe('replacement-token')
+    expect(service.getStatus()).toMatchObject({ remoteStatus: 'ok', needsAuthentication: false, isSyncing: false, hasChanges: true })
+    expect(service.getStatus().error).toBeUndefined()
+    expect(service.getStatus().lastSync).toBeUndefined()
+    expect(await adapter.promises.readFile('/repo/main.tex', 'utf8')).toBe('unsynced draft')
+  } finally { fetch.mockRestore() }
+})
+
+test('invalid replacement retains prior credentials and local files', async () => {
+  const { service } = await branchFixture()
+  const fetch = spyOn(git, 'fetch').mockRejectedValue(Object.assign(new Error('HTTP Error: 401'), { data: { statusCode: 401 } }))
+  try {
+    await expect(service.updateToken('bad-token')).rejects.toThrow('401')
+    expect(service.getConfig()?.token).toBe('test-token')
+    expect(service.getStatus()).toMatchObject({ isSyncing: false, remoteStatus: 'error', needsAuthentication: true })
+    expect(await adapter.promises.readFile('/repo/main.tex', 'utf8')).toBe('original')
+  } finally { fetch.mockRestore() }
+})
+
+test('verified unchanged remote completes sync and clears a prior error', async () => {
+  const { service, oid } = await branchFixture()
+  await git.writeRef({ fs: adapter, dir, ref: 'refs/remotes/origin/main', value: oid })
+  Object.assign((service as any).status, { needsAuthentication: true, error: 'Denied' })
+  const fetch = spyOn(git, 'fetch').mockResolvedValue({} as any)
+  try {
+    await service.sync()
+    expect(service.getStatus()).toMatchObject({ remoteStatus: 'ok', needsAuthentication: false, isSyncing: false })
+    expect(service.getStatus().error).toBeUndefined()
+    expect(service.getStatus().lastSync).toBeInstanceOf(Date)
+  } finally { fetch.mockRestore() }
+})
+
+test('sync keeps its operation lock through pull and push and propagates a failed push', async () => {
+  const { service, oid } = await branchFixture()
+  const lastSync = new Date('2026-01-01T00:00:00Z')
+  Object.assign((service as any).status, { lastSync })
+  await git.writeRef({ fs: adapter, dir, ref: 'refs/remotes/origin/main', value: oid })
+  const check = spyOn(service, 'checkRemote').mockResolvedValue({ hasRemoteChanges: true, hasLocalChanges: false })
+  const fetch = spyOn(git, 'fetch').mockResolvedValue({} as any)
+  const pull = spyOn(git, 'pull').mockImplementation(async (options: any) => {
+    expect(service.getStatus().isSyncing).toBe(true)
+    expect(options.corsProxy).toBe('https://cors.isomorphic-git.org')
+    expect(options.url).toBe('https://github.com/example/project.git')
+  })
+  const push = spyOn(git, 'push').mockImplementation(async (options: any) => {
+    expect(service.getStatus().isSyncing).toBe(true)
+    expect(service.getStatus().lastSync).toEqual(lastSync)
+    expect(options.corsProxy).toBe('https://cors.isomorphic-git.org')
+    throw Object.assign(new Error('HTTP Error: 403'), { data: { statusCode: 403 } })
+  })
+  try {
+    await expect(service.sync()).rejects.toThrow('403')
+    expect(pull).toHaveBeenCalledTimes(1)
+    expect(push).toHaveBeenCalledTimes(1)
+    expect(service.getStatus()).toMatchObject({ isSyncing: false, lastSync, needsAuthentication: true })
+  } finally { check.mockRestore(); fetch.mockRestore(); pull.mockRestore(); push.mockRestore() }
+})
+
+
+test('working-tree root stat canonicalizes dot segments for browser storage', async () => {
+  const original = service.stat.bind(service)
+  const stat = spyOn(service, 'stat').mockImplementation(async path => {
+    if (path.split('/').includes('.')) throw new Error('OPFS does not accept dot path segments')
+    return original(path)
+  })
+  try {
+    expect((await adapter.promises.lstat('/repo/.')).isDirectory()).toBe(true)
+    expect(stat).toHaveBeenCalledWith('/repo')
+    await git.init({ fs: adapter, dir, defaultBranch: 'main' })
+    await adapter.promises.writeFile('/repo/draft.tex', 'unsynced draft')
+    expect(await git.statusMatrix({ fs: adapter, dir })).toEqual([['draft.tex', 0, 2, 0]])
+  } finally { stat.mockRestore() }
+})

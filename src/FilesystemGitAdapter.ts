@@ -163,6 +163,8 @@ export function createFilesystemGitAdapter(fs: FileSystemService) {
     },
 
     async stat(filepath: string): Promise<Stats> {
+      // Git walks the working-tree root as /git/.; OPFS handles require a canonical path.
+      filepath = filepath.replace(/\/\.(?=\/|$)/g, '') || '/'
       try {
         const stats = await fs.stat(filepath)
         return createStats(
