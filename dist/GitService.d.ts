@@ -1,17 +1,21 @@
 /**
- * GitService - Git operations using OPFS storage
+ * GitService - Git operations using siglum-filesystem
  *
- * Uses OPFS (Origin Private File System) for git repository storage,
- * providing fast, persistent file access without in-memory caching.
+ * Uses @siglum/filesystem for git repository storage, providing a unified
+ * storage layer shared with the rest of the application.
  *
  * isomorphic-git is lazily loaded on first git operation to reduce initial bundle.
  */
-import type { GitConfig, GitStatus, FileChange, GitStatusListener, FileTreeListener } from './types';
+import type { GitConfig, GitStatus, FileChange, GitStatusListener, FileTreeListener, Collaborator, CollaboratorPresence, CollaboratorsListener, BranchDiff, ConflictingFile } from './types';
 export interface GitServiceOptions {
     /** CORS proxy URL for git operations */
     corsProxy?: string;
     /** Storage key for config persistence */
     storageKey?: string;
+    /** Flush editor drafts before switching the working tree. */
+    beforeBranchSwitch?: () => Promise<void>;
+    /** Flush editor drafts before reconnect, clone, or force pull. */
+    beforeWorkingTreeChange?: () => Promise<void>;
     /** Callback when file tree changes */
     onFileTreeChange?: FileTreeListener;
 }
@@ -22,7 +26,10 @@ export declare class GitService {
     private syncIntervalId;
     private statusListeners;
     private fileTreeListeners;
+    private collaboratorsListeners;
     private remoteCheckCleanup;
+    private collaboratorsPollId;
+    private presenceUpdateId;
     private options;
     constructor(options?: GitServiceOptions);
     private loadConfig;
@@ -34,21 +41,26 @@ export declare class GitService {
      */
     subscribeStatus(listener: GitStatusListener): () => void;
     /**
+     * Change the branch (requires reconnect to take effect)
+     */
+    setBranch(branch: string): void;
+    /**
      * Subscribe to file tree changes
      */
     subscribeFileTree(listener: FileTreeListener): () => void;
     getConfig(): GitConfig | null;
     getStatus(): GitStatus;
     get isConnected(): boolean;
-    private getRepoUrl;
     /**
-     * Clear the git directory in OPFS
+     * Ensure the git filesystem is mounted with its own isolated namespace
      */
-    private clearGitDir;
+    private ensureMounted;
+    private getRepoUrl;
     /**
      * Connect to a git repository
      */
     connect(config: GitConfig): Promise<void>;
+    private cloneReplacement;
     /**
      * Create a new repository on GitHub
      */
@@ -93,12 +105,27 @@ export declare class GitService {
     }>;
     /**
      * Sync with remote (pull, commit local changes, push)
+     * Returns info about what changed for the UI to react to
      */
-    sync(): Promise<void>;
+    sync(): Promise<{
+        pulledFiles?: string[];
+        hasConflict?: boolean;
+        conflictingFiles?: ConflictingFile[];
+    }>;
+    /**
+     * Get list of files that changed between two commits
+     */
+    private getChangedFilesBetweenCommits;
+    /**
+     * Get the number of lines that differ between two commits for a specific file
+     */
+    private getLineDiffCount;
     /**
      * Force pull (discard local changes)
      */
     forcePull(): Promise<void>;
+    /** Restore the saved checkout after an interrupted replacement. */
+    recoverCheckout(): Promise<void>;
     /**
      * Force push (overwrite remote)
      */
@@ -130,6 +157,66 @@ export declare class GitService {
      * Update sync interval
      */
     updateSyncInterval(interval: GitConfig['syncInterval']): void;
+    private notifyCollaboratorsListeners;
+    /**
+     * Subscribe to collaborators list changes
+     */
+    subscribeCollaborators(listener: CollaboratorsListener): () => void;
+    /**
+     * Get the draft branch name for a user
+     */
+    getDraftBranchName(username?: string): string;
+    /**
+     * Extract username from repo URL (e.g., "adam-weber/resume" -> "adam-weber")
+     */
+    private extractUsernameFromRepo;
+    /**
+     * Start collaborative editing mode - creates/switches to user's draft branch
+     */
+    startCollaborativeEditing(): Promise<void>;
+    /**
+     * List all collaborators (users with draft/* branches)
+     */
+    listCollaborators(): Promise<Collaborator[]>;
+    /**
+     * Get diff between current branch and another collaborator's branch
+     */
+    getCollaboratorDiff(collaboratorBranch: string): Promise<BranchDiff>;
+    private getTreeFiles;
+    /**
+     * Merge changes from a collaborator's branch into current branch
+     */
+    mergeFromCollaborator(collaboratorBranch: string, files?: string[]): Promise<void>;
+    /**
+     * Get file content from a collaborator's branch
+     */
+    getCollaboratorFile(collaboratorBranch: string, filepath: string): Promise<string | null>;
+    /**
+     * Update presence info (for other collaborators to see)
+     */
+    updatePresence(presence: Omit<CollaboratorPresence, 'lastSeen'>): Promise<void>;
+    /**
+     * Get presence info from a collaborator's branch
+     */
+    getCollaboratorPresence(collaboratorBranch: string): Promise<CollaboratorPresence | null>;
+    /**
+     * Publish draft to main via PR (uses GitHub API)
+     */
+    publishDraft(title: string, body: string): Promise<{
+        prUrl: string;
+    } | null>;
+    private startPresenceUpdates;
+    private stopPresenceUpdates;
+    private startCollaboratorPolling;
+    private stopCollaboratorPolling;
+    /**
+     * Check if currently in collaborative editing mode (on a draft/* branch)
+     */
+    isCollaborativeMode(): boolean;
+    /**
+     * Stop collaborative editing and cleanup
+     */
+    stopCollaborativeEditing(): void;
 }
 export declare function getGitService(options?: GitServiceOptions): GitService;
 //# sourceMappingURL=GitService.d.ts.map

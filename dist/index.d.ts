@@ -1,18 +1,20 @@
 /**
  * @siglum/git
  *
- * Browser-based Git operations using OPFS storage with isomorphic-git.
+ * Browser-based Git operations using siglum-filesystem with isomorphic-git.
  *
- * ## Standalone OPFS Adapter
+ * ## Filesystem Adapter
  *
- * Use the OPFS adapter directly with isomorphic-git:
+ * Use the filesystem adapter directly with isomorphic-git:
  *
  * ```typescript
- * import { createOPFSGitAdapter } from '@siglum/git'
+ * import { createFilesystemGitAdapter } from '@siglum/git'
+ * import { fileSystem } from '@siglum/filesystem'
  * import git from 'isomorphic-git'
  * import http from 'isomorphic-git/http/web'
  *
- * const fs = createOPFSGitAdapter()
+ * await fileSystem.mountAuto('/repo')
+ * const fs = createFilesystemGitAdapter(fileSystem)
  *
  * await git.clone({
  *   fs,
@@ -51,6 +53,7 @@
  * ```
  */
 export { createOPFSGitAdapter, getOPFSGitAdapter } from './OPFSGitAdapter';
+export { createFilesystemGitAdapter, type FilesystemGitAdapter } from './FilesystemGitAdapter';
 export { GitService, getGitService, type GitServiceOptions } from './GitService';
-export type { GitConfig, GitStatus, FileChange, FileItem, GitStatusListener, FileTreeListener } from './types';
+export type { GitConfig, GitStatus, FileChange, FileItem, GitStatusListener, FileTreeListener, Collaborator, CollaboratorPresence, CollaboratorsListener, BranchDiff, ConflictingFile } from './types';
 //# sourceMappingURL=index.d.ts.map
