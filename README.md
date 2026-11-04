@@ -1,6 +1,7 @@
 # @siglum/git
 
 [![npm version](https://img.shields.io/npm/v/@siglum/git)](https://www.npmjs.com/package/@siglum/git)
+[![weekly npm downloads](https://img.shields.io/npm/dw/@siglum/git)](https://www.npmjs.com/package/@siglum/git)
 
 Browser-based Git operations using OPFS storage with isomorphic-git.
 
