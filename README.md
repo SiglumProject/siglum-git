@@ -1,138 +1,50 @@
 # @siglum/git
 
 [![npm version](https://img.shields.io/npm/v/@siglum/git)](https://www.npmjs.com/package/@siglum/git)
+[![weekly npm downloads](https://img.shields.io/npm/dw/@siglum/git)](https://www.npmjs.com/package/@siglum/git)
 
-Browser-based Git operations using OPFS storage with isomorphic-git.
+Browser Git operations backed by `@siglum/filesystem` and isomorphic-git.
+Use the filesystem adapter directly, or `GitService` for synchronization,
+status subscriptions, and conflict handling.
 
-## Installation
+## Install
 
-```bash
-npm install @siglum/git isomorphic-git
+```sh
+npm install @siglum/git @siglum/filesystem isomorphic-git
 ```
 
-## Standalone OPFS Adapter
-
-Use the OPFS adapter directly with isomorphic-git for full control:
+## Quick start
 
 ```typescript
-import { createOPFSGitAdapter } from '@siglum/git'
 import git from 'isomorphic-git'
-import http from 'isomorphic-git/http/web'
+import { fileSystem } from '@siglum/filesystem'
+import { createFilesystemGitAdapter } from '@siglum/git'
 
-const fs = createOPFSGitAdapter()
+await fileSystem.mountAuto('/repo', { namespace: 'example-repo' })
+const fs = createFilesystemGitAdapter(fileSystem)
 
-// Clone a repository
-await git.clone({
-  fs,
-  http,
-  dir: '/repo',
-  url: 'https://github.com/user/repo',
-  corsProxy: 'https://cors.isomorphic-git.org'
-})
+await git.init({ fs, dir: '/repo', defaultBranch: 'main' })
+await fs.promises.writeFile('/repo/hello.txt', 'Hello, world!')
+await git.add({ fs, dir: '/repo', filepath: 'hello.txt' })
 
-// Read files
-const content = await fs.promises.readFile('/repo/README.md', 'utf8')
-
-// Write files
-await fs.promises.writeFile('/repo/new-file.txt', 'Hello, world!')
-
-// Commit changes
-await git.add({ fs, dir: '/repo', filepath: 'new-file.txt' })
-await git.commit({
+const commit = await git.commit({
   fs,
   dir: '/repo',
-  message: 'Add new file',
-  author: { name: 'User', email: 'user@example.com' }
+  message: 'Add hello.txt',
+  author: { name: 'Your name', email: 'you@example.com' }
 })
+console.log(commit)
 ```
 
-The adapter implements the full Node.js `fs.promises` API that isomorphic-git expects, backed by the browser's Origin Private File System (OPFS).
+This creates a local repository in browser storage. Remote synchronization
+and the higher-level service are covered in the usage guide.
 
-## GitService (Higher-Level API)
+## Documentation
 
-For a batteries-included experience with sync, conflict detection, and reactive subscriptions:
-
-```typescript
-import { GitService } from '@siglum/git'
-
-const git = new GitService({
-  corsProxy: 'https://cors.isomorphic-git.org',
-  onFileTreeChange: (files) => console.log('Files:', files)
-})
-
-// Connect to a repository
-await git.connect({
-  provider: 'github',
-  repoUrl: 'https://github.com/user/repo',
-  branch: 'main',
-  token: 'ghp_xxx',
-  syncInterval: '15min'
-})
-
-// Read/write files
-const content = await git.readFile('/main.tex')
-await git.writeFile('/main.tex', 'Updated content')
-
-// Sync with remote
-await git.sync()
-
-// Subscribe to status changes
-git.subscribeStatus((status) => {
-  console.log('Connected:', status.isConnected)
-  console.log('Syncing:', status.isSyncing)
-  console.log('Has changes:', status.hasChanges)
-})
-```
-
-### GitService Features
-
-- **Auto-sync** - Configurable sync intervals (5min, 15min, 30min, 1hour, manual)
-- **Conflict detection** - Detects when both local and remote have changes
-- **Status subscriptions** - Reactive updates for UI integration
-- **File tree subscriptions** - Get notified when files change
-- **Force push/pull** - Resolve conflicts by forcing one direction
-- **Branch switching** - Switch branches or create new ones
-- **GitHub integration** - Create repositories directly via GitHub API
-
-## API
-
-### createOPFSGitAdapter()
-
-Creates an isomorphic-git compatible filesystem backed by OPFS.
-
-```typescript
-const fs = createOPFSGitAdapter()
-// Use with isomorphic-git
-await git.clone({ fs, dir: '/repo', ... })
-```
-
-### getOPFSGitAdapter()
-
-Returns a singleton instance of the adapter.
-
-```typescript
-const fs = getOPFSGitAdapter()
-```
-
-### GitService
-
-| Method | Description |
-|--------|-------------|
-| `connect(config)` | Clone and connect to a repository |
-| `disconnect()` | Disconnect and clear local data |
-| `sync()` | Pull remote changes, commit local changes, push |
-| `pull()` | Pull changes from remote |
-| `push()` | Push changes to remote |
-| `commit(message)` | Commit staged changes |
-| `forcePull()` | Discard local changes, pull remote |
-| `forcePush()` | Force push local changes to remote |
-| `switchBranch(branch)` | Switch to or create a branch |
-| `readFile(path)` | Read file content |
-| `writeFile(path, content)` | Write file content |
-| `getChanges()` | Get list of changed files |
-| `subscribeStatus(listener)` | Subscribe to status changes |
-| `subscribeFileTree(listener)` | Subscribe to file tree changes |
+- [Adapters, GitService, and recovery](docs/usage.md)
+- [Development and project map](docs/development.md)
+- [Contributor instructions](AGENTS.md)
 
 ## License
 
-MIT
+MIT, as declared in the [package metadata](package.json).
