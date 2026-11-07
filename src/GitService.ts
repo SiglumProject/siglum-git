@@ -22,7 +22,9 @@ import type {
   CollaboratorPresence,
   CollaboratorsListener,
   BranchDiff,
-  ConflictingFile
+  ConflictingFile,
+  GitConflictReview,
+  GitConflictResolution
 } from './types'
 
 // Polyfill Buffer for browser
@@ -49,6 +51,43 @@ async function loadGitModules() {
 
 // Git directory within the filesystem
 const GIT_DIR = '/git'
+
+type ConflictBytes = Uint8Array | null
+
+interface IncomingConflictPath {
+  path: string
+  previous: boolean
+  incoming: boolean
+}
+
+interface ConflictReviewState {
+  id: string
+  config: GitConfig
+  connection: GitConfig
+  localHead: string
+  remoteHead: string
+  affected: IncomingConflictPath[]
+  workingFiles: Map<string, ConflictBytes>
+  conflicts: Map<string, { binary: boolean }>
+}
+
+function sameConflictBytes(left: ConflictBytes, right: ConflictBytes): boolean {
+  if (left === null || right === null) return left === right
+  if (left.byteLength !== right.byteLength) return false
+  return left.every((byte, index) => byte === right[index])
+}
+
+function decodeConflictText(bytes: ConflictBytes): string | null {
+  if (!bytes || bytes.includes(0)) return null
+  try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes) }
+  catch { return null }
+}
+
+function safeConflictPath(path: string): boolean {
+  return !/[\\\0\r\n]/.test(path) && path.split('/').every(part =>
+    part && part !== '.' && part !== '..' && part.toLowerCase() !== '.git')
+}
+
 
 export interface GitServiceOptions {
   /** CORS proxy URL for git operations */
@@ -83,6 +122,8 @@ export class GitService {
   private collaboratorsPollId: number | null = null
   private presenceUpdateId: number | null = null
   private options: GitServiceOptions
+  private conflictReview: ConflictReviewState | null = null
+  private pendingWorktreeWrites = 0
 
   constructor(options: GitServiceOptions = {}) {
     this.options = {
@@ -444,7 +485,9 @@ export class GitService {
   async disconnect(): Promise<void> {
     if (this.status.isSyncing) throw new Error('Another Git operation is in progress')
     await this.options.beforeWorkingTreeChange?.()
+    if (this.status.isSyncing) throw new Error('Another Git operation is in progress')
     this.stopAutoSync()
+    this.conflictReview = null
     this.config = null
     // Disconnect removes credentials; retain the checkout and unsynced work.
     this.status = {
@@ -560,6 +603,7 @@ export class GitService {
 
   async push(): Promise<void> {
     if (!this.config) throw new Error('Not configured')
+    if (this.status.isSyncing) throw new Error('Another Git operation is in progress')
 
     this.status.isSyncing = true
     this.status.error = undefined
@@ -584,7 +628,9 @@ export class GitService {
    */
   async commit(message: string): Promise<void> {
     if (!this.config) throw new Error('Not configured')
+    if (this.status.isSyncing) throw new Error('Another Git operation is in progress')
 
+    this.pendingWorktreeWrites++
     try {
       await this.ensureMounted()
       const { git } = await loadGitModules()
@@ -620,6 +666,8 @@ export class GitService {
     } catch (error) {
       this.status.error = error instanceof Error ? error.message : 'Commit failed'
       throw error
+    } finally {
+      this.pendingWorktreeWrites--
     }
   }
 
@@ -635,15 +683,12 @@ export class GitService {
     for (const [filepath, head, workdir, stage] of statusMatrix) {
       if (filepath.startsWith('.git')) continue
 
-      // Status values: 0=absent, 1=same as HEAD, 2=different from HEAD
-      if (head === 0 && workdir === 2 && stage === 0) {
-        changes.push({ path: filepath, status: 'untracked' })
-      } else if (head === 0 && workdir === 2 && stage === 2) {
-        changes.push({ path: filepath, status: 'added' })
-      } else if (head === 1 && workdir === 2 && stage === 1) {
-        changes.push({ path: filepath, status: 'modified' })
-      } else if (head === 1 && workdir === 0 && stage === 0) {
+      if (head === 0 && workdir !== 0) {
+        changes.push({ path: filepath, status: stage === 0 ? 'untracked' : 'added' })
+      } else if (head !== 0 && workdir === 0) {
         changes.push({ path: filepath, status: 'deleted' })
+      } else if (workdir !== head) {
+        changes.push({ path: filepath, status: 'modified' })
       }
     }
 
@@ -894,6 +939,209 @@ export class GitService {
     } catch (error) {
       console.error('[GitService] getLineDiffCount failed:', error)
       return undefined
+    }
+  }
+
+  private async conflictHeads(config: GitConfig) {
+    const { git } = await loadGitModules()
+    const ref = await git.currentBranch({ fs: this.fs, dir: GIT_DIR, fullname: true })
+    if (ref !== `refs/heads/${config.branch}`) throw new Error('The checked-out Git branch changed.')
+    const localHead = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref })
+    const remoteHead = await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref: `refs/remotes/origin/${config.branch}` })
+    return { ref, localHead, remoteHead }
+  }
+
+  private async incomingConflictPaths(localHead: string, remoteHead: string): Promise<IncomingConflictPath[]> {
+    const { git } = await loadGitModules()
+    const paths: IncomingConflictPath[] = []
+    await git.walk({
+      fs: this.fs, dir: GIT_DIR, trees: [git.TREE({ ref: localHead }), git.TREE({ ref: remoteHead })],
+      map: async (path, [before, after]) => {
+        if (path === '.') return
+        if (before && after && await before.oid() === await after.oid() && await before.mode() === await after.mode()) return null
+        const previousType = await before?.type()
+        const incomingType = await after?.type()
+        if ((previousType === 'tree' && (!after || incomingType === 'tree')) ||
+            (incomingType === 'tree' && !before)) return
+        if (!safeConflictPath(path) || (before && (previousType !== 'blob' || await before.mode() !== 0o100644)) ||
+            (after && (incomingType !== 'blob' || await after.mode() !== 0o100644))) {
+          throw new Error(`Resolve this Git file type or directory change outside Siglum: ${path}`)
+        }
+        paths.push({ path, previous: !!before, incoming: !!after })
+      },
+    })
+    return paths
+  }
+
+  private async readConflictBytes(path: string): Promise<ConflictBytes> {
+    try {
+      const content = await this.fs.promises.readFile(path)
+      if (typeof content === 'string') throw new Error(`Expected binary bytes for ${path}`)
+      return content
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ENOENT') return null
+      throw error
+    }
+  }
+
+  /** Review the fetched same-branch changes against the current editor files. */
+  async getConflictReview(): Promise<GitConflictReview> {
+    if (!this.config) throw new Error('Not configured')
+    if (this.status.isSyncing || this.pendingWorktreeWrites) throw new Error('Another Git operation is in progress')
+    const connection = this.config
+    const config = { ...connection }
+    this.status.isSyncing = true
+    this.conflictReview = null
+    this.notifyStatusListeners()
+    try {
+      await this.options.beforeWorkingTreeChange?.()
+      await this.ensureMounted()
+      const { git } = await loadGitModules()
+      const { localHead, remoteHead } = await this.conflictHeads(config)
+      if (localHead === remoteHead) throw new Error('There are no fetched remote changes to review.')
+      if (!await git.isDescendent({ fs: this.fs, dir: GIT_DIR, oid: remoteHead, ancestor: localHead })) {
+        throw new Error('The branches diverged. Merge them in Git before applying this review.')
+      }
+
+      const affected = await this.incomingConflictPaths(localHead, remoteHead)
+      const workingFiles = new Map<string, ConflictBytes>()
+      const conflicts: ConflictReviewState['conflicts'] = new Map()
+      const files: GitConflictReview['files'] = []
+      for (const { path, previous, incoming } of affected) {
+        const local = await this.readConflictBytes(`${GIT_DIR}/${path}`)
+        workingFiles.set(path, local)
+        const base = previous
+          ? (await git.readBlob({ fs: this.fs, dir: GIT_DIR, oid: localHead, filepath: path })).blob : null
+        if (sameConflictBytes(local, base)) continue
+        const remote = incoming
+          ? (await git.readBlob({ fs: this.fs, dir: GIT_DIR, oid: remoteHead, filepath: path })).blob : null
+        const localText = decodeConflictText(local)
+        const remoteText = decodeConflictText(remote)
+        const baseText = decodeConflictText(base)
+        const isBinary = (local !== null && localText === null) ||
+          (remote !== null && remoteText === null) || (base !== null && baseText === null)
+        conflicts.set(path, { binary: isBinary })
+        files.push({ path, localText, remoteText, baseText, isBinary, localExists: local !== null, remoteExists: remote !== null })
+      }
+      if (!files.length) throw new Error('There are no conflicting files to review. Sync again.')
+      const id = this.generateId()
+      if (this.config !== connection || this.config.branch !== config.branch) {
+        throw new Error('The repository connection changed during review.')
+      }
+      this.conflictReview = { id, config, connection, localHead, remoteHead, affected, workingFiles, conflicts }
+      return { id, branch: config.branch, localHead, remoteHead, files }
+    } finally {
+      this.status.isSyncing = false
+      this.notifyStatusListeners()
+    }
+  }
+
+  private async refreshConflictRemote(config: GitConfig): Promise<void> {
+    const { git, http } = await loadGitModules()
+    await git.fetch({
+      fs: this.fs, http, dir: GIT_DIR, url: this.getRepoUrl(config), remote: 'origin',
+      ref: config.branch, singleBranch: true, corsProxy: this.options.corsProxy,
+      onAuth: () => ({ username: config.username || config.token, password: config.token }),
+    })
+  }
+
+  private async writeConflictBytes(path: string, bytes: ConflictBytes): Promise<void> {
+    if (bytes !== null) {
+      await this.fs.promises.writeFile(path, bytes)
+    } else {
+      try { await this.fs.promises.unlink(path) }
+      catch (error) { if ((error as { code?: string }).code !== 'ENOENT') throw error }
+    }
+  }
+
+  /** Apply reviewed choices locally and leave any retained edits available for the next sync. */
+  async applyConflictResolution(reviewId: string, resolutions: GitConflictResolution[]): Promise<void> {
+    if (this.status.isSyncing || this.pendingWorktreeWrites) throw new Error('Another Git operation is in progress')
+    const review = this.conflictReview
+    if (!review || review.id !== reviewId || this.config !== review.connection ||
+        this.config.branch !== review.config.branch) {
+      throw new Error('The conflict review is stale. Open it again.')
+    }
+    const choices = new Map<string, GitConflictResolution>()
+    for (const resolution of resolutions) {
+      const conflict = review.conflicts.get(resolution.path)
+      if (!conflict || choices.has(resolution.path) ||
+          (resolution.choice !== 'local' && resolution.choice !== 'remote' &&
+           (resolution.choice !== 'merged' || conflict.binary || typeof resolution.content !== 'string'))) {
+        throw new Error('Choose one valid resolution for every conflicting file.')
+      }
+      choices.set(resolution.path, resolution)
+    }
+    if (choices.size !== review.conflicts.size) throw new Error('Resolve every conflicting file before applying.')
+
+    this.status.isSyncing = true
+    this.status.error = undefined
+    this.notifyStatusListeners()
+    try {
+      await this.options.beforeWorkingTreeChange?.()
+      await this.refreshConflictRemote(review.config)
+      const { git } = await loadGitModules()
+      const { ref, localHead, remoteHead } = await this.conflictHeads(review.config)
+      if (this.config !== review.connection || this.config.branch !== review.config.branch ||
+          localHead !== review.localHead || remoteHead !== review.remoteHead) {
+        this.conflictReview = null
+        throw new Error('A Git revision changed during review. Open the conflict again.')
+      }
+      const paths = review.affected.map(file => file.path)
+      const status = await git.statusMatrix({ fs: this.fs, dir: GIT_DIR, filepaths: paths })
+      if (status.some(([path, head, , stage]) => review.workingFiles.has(path) && head !== stage)) {
+        throw new Error('Affected files have staged changes. Resolve them in Git before applying this review.')
+      }
+      const checkout = { fs: this.fs, dir: GIT_DIR, ref: remoteHead, filepaths: paths, noUpdateHead: true, force: true }
+      await git.checkout({ ...checkout, dryRun: true })
+      const indexPath = `${GIT_DIR}/.git/index`
+      const previousIndex = await this.readConflictBytes(indexPath)
+      for (const [path, reviewed] of review.workingFiles) {
+        if (!sameConflictBytes(reviewed, await this.readConflictBytes(`${GIT_DIR}/${path}`))) {
+          this.conflictReview = null
+          throw new Error(`The local file changed during review: ${path}. Open the conflict again.`)
+        }
+      }
+      const latest = await this.conflictHeads(review.config)
+      if (latest.localHead !== localHead || latest.remoteHead !== remoteHead ||
+          !sameConflictBytes(previousIndex, await this.readConflictBytes(indexPath))) {
+        this.conflictReview = null
+        throw new Error('A Git revision changed during review. Open the conflict again.')
+      }
+
+      try {
+        await git.checkout(checkout)
+        for (const [path, resolution] of choices) {
+          if (resolution.choice === 'remote') continue
+          const bytes = resolution.choice === 'local' ? review.workingFiles.get(path)! : new TextEncoder().encode(resolution.content)
+          await this.writeConflictBytes(`${GIT_DIR}/${path}`, bytes)
+        }
+        await git.writeRef({ fs: this.fs, dir: GIT_DIR, ref, value: remoteHead, force: true })
+      } catch (error) {
+        // The checkout is restricted to the paths backed up in the review.
+        try {
+          for (const [path, bytes] of review.workingFiles) await this.writeConflictBytes(`${GIT_DIR}/${path}`, bytes)
+          await this.writeConflictBytes(indexPath, previousIndex)
+          if (await git.resolveRef({ fs: this.fs, dir: GIT_DIR, ref }) === remoteHead) {
+            await git.writeRef({ fs: this.fs, dir: GIT_DIR, ref, value: localHead, force: true })
+          }
+        } catch (rollbackError) {
+          throw new Error('Could not finish or fully restore the local conflict resolution.', { cause: rollbackError })
+        }
+        throw error
+      }
+
+      this.conflictReview = null
+      this.status.hasConflict = false
+      this.status.conflictingFiles = undefined
+      this.status.conflictSource = undefined
+      this.status.ahead = 0
+      this.status.behind = 0
+      await this.syncFileTree()
+      await this.getChanges()
+    } finally {
+      this.status.isSyncing = false
+      this.notifyStatusListeners()
     }
   }
 
@@ -1400,6 +1648,7 @@ export class GitService {
    */
   async mergeFromCollaborator(collaboratorBranch: string, files?: string[]): Promise<void> {
     if (!this.config) throw new Error('Not connected')
+    if (this.status.isSyncing) throw new Error('Another Git operation is in progress')
 
     this.status.isSyncing = true
     this.notifyStatusListeners()
@@ -1525,13 +1774,14 @@ export class GitService {
    * Update presence info (for other collaborators to see)
    */
   async updatePresence(presence: Omit<CollaboratorPresence, 'lastSeen'>): Promise<void> {
-    if (!this.config) return
+    if (!this.config || this.status.isSyncing) return
 
     const presenceData: CollaboratorPresence = {
       ...presence,
       lastSeen: new Date()
     }
 
+    this.pendingWorktreeWrites++
     try {
       // Write presence to .siglum/presence.json in working directory
       const presencePath = '/.siglum/presence.json'
@@ -1550,6 +1800,8 @@ export class GitService {
       await this.push()
     } catch (error) {
       console.warn('[GitService] updatePresence failed:', error)
+    } finally {
+      this.pendingWorktreeWrites--
     }
   }
 
@@ -1577,10 +1829,12 @@ export class GitService {
     if (!this.config || this.config.provider !== 'github') {
       throw new Error('Publishing requires GitHub')
     }
+    if (this.status.isSyncing) throw new Error('Another Git operation is in progress')
 
     const draftBranch = this.getDraftBranchName()
     const repoPath = this.config.repoUrl.replace(/^https?:\/\/github\.com\//, '').replace(/\.git$/, '')
 
+    this.pendingWorktreeWrites++
     try {
       // First, ensure all changes are pushed
       const changes = await this.getChanges()
@@ -1615,6 +1869,8 @@ export class GitService {
     } catch (error) {
       console.error('[GitService] publishDraft failed:', error)
       throw error
+    } finally {
+      this.pendingWorktreeWrites--
     }
   }
 

@@ -53,6 +53,34 @@ export interface ConflictingFile {
     path: string;
     linesChanged?: number;
 }
+/** An immutable review of one same-branch conflict. */
+export interface GitConflictReview {
+    id: string;
+    branch: string;
+    localHead: string;
+    remoteHead: string;
+    files: GitConflictReviewFile[];
+}
+export interface GitConflictReviewFile {
+    path: string;
+    localText: string | null;
+    remoteText: string | null;
+    baseText: string | null;
+    isBinary: boolean;
+    localExists: boolean;
+    remoteExists: boolean;
+}
+export type GitConflictResolution = {
+    path: string;
+    choice: 'local';
+} | {
+    path: string;
+    choice: 'remote';
+} | {
+    path: string;
+    choice: 'merged';
+    content: string;
+};
 export interface FileItem {
     id: string;
     name: string;

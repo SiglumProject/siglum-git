@@ -121,6 +121,8 @@ const fs = getOPFSGitAdapter()
 | `pull()` | Pull changes from remote |
 | `push()` | Push changes to remote |
 | `commit(message)` | Stage and commit working-tree changes |
+| `getConflictReview()` | Review fetched changes against current working files |
+| `applyConflictResolution(id, choices)` | Apply a reviewed choice locally without pushing |
 | `forcePull()` | Discard local changes, pull remote |
 | `forcePush()` | Force push local changes to remote |
 | `switchBranch(branch)` | Switch to or create a branch |
@@ -144,3 +146,17 @@ attempt to restore that snapshot.
 If an interrupted replacement requires recovery, call
 `await git.recoverCheckout()` after browser storage is available again. The
 snapshot is retained in the separate `siglum-git-recovery` namespace.
+
+## Reviewing conflicts
+
+After synchronization reports a same-branch conflict, call
+`getConflictReview()` to obtain the review ID, compared commits and affected
+files. Each file includes base, local and remote text when it is textual.
+Binary files retain byte-preserving local/remote choices.
+
+Pass one choice per conflicting file to `applyConflictResolution(review.id,
+choices)`. A choice is `{ path, choice: 'local' }`, `{ path, choice: 'remote' }`,
+or `{ path, choice: 'merged', content }`. Applying the review does not push.
+A changed local file, advanced remote revision, different connection or staged
+change invalidates the review. Open a fresh review rather than retrying stale
+choices. Divergent committed history requires a separate Git merge.

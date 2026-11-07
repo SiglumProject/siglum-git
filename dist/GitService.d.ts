@@ -6,7 +6,7 @@
  *
  * isomorphic-git is lazily loaded on first git operation to reduce initial bundle.
  */
-import type { GitConfig, GitStatus, FileChange, GitStatusListener, FileTreeListener, Collaborator, CollaboratorPresence, CollaboratorsListener, BranchDiff, ConflictingFile } from './types';
+import type { GitConfig, GitStatus, FileChange, GitStatusListener, FileTreeListener, Collaborator, CollaboratorPresence, CollaboratorsListener, BranchDiff, ConflictingFile, GitConflictReview, GitConflictResolution } from './types';
 export interface GitServiceOptions {
     /** CORS proxy URL for git operations */
     corsProxy?: string;
@@ -31,6 +31,8 @@ export declare class GitService {
     private collaboratorsPollId;
     private presenceUpdateId;
     private options;
+    private conflictReview;
+    private pendingWorktreeWrites;
     constructor(options?: GitServiceOptions);
     private loadConfig;
     private recordRemoteError;
@@ -125,6 +127,15 @@ export declare class GitService {
      * Get the number of lines that differ between two commits for a specific file
      */
     private getLineDiffCount;
+    private conflictHeads;
+    private incomingConflictPaths;
+    private readConflictBytes;
+    /** Review the fetched same-branch changes against the current editor files. */
+    getConflictReview(): Promise<GitConflictReview>;
+    private refreshConflictRemote;
+    private writeConflictBytes;
+    /** Apply reviewed choices locally and leave any retained edits available for the next sync. */
+    applyConflictResolution(reviewId: string, resolutions: GitConflictResolution[]): Promise<void>;
     /**
      * Force pull (discard local changes)
      */

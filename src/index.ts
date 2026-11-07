@@ -74,5 +74,8 @@ export type {
   CollaboratorPresence,
   CollaboratorsListener,
   BranchDiff,
-  ConflictingFile
+  ConflictingFile,
+  GitConflictReview,
+  GitConflictReviewFile,
+  GitConflictResolution
 } from './types'

@@ -348,3 +348,107 @@ test('working-tree root stat canonicalizes dot segments for browser storage', as
     expect(await git.statusMatrix({ fs: adapter, dir })).toEqual([['draft.tex', 0, 2, 0]])
   } finally { stat.mockRestore() }
 })
+
+async function conflictFixture() {
+  const { service: gitService, oid: base } = await branchFixture()
+  await git.branch({ fs: adapter, dir, ref: 'incoming', checkout: true })
+  await adapter.promises.writeFile(dir + '/main.tex', 'from remote')
+  await adapter.promises.writeFile(dir + '/remote-only.tex', 'remote addition')
+  await git.add({ fs: adapter, dir, filepath: '.' })
+  const remote = await git.commit({ fs: adapter, dir, message: 'remote', author: { name: 'Test', email: 'test@example.test' } })
+  await git.writeRef({ fs: adapter, dir, ref: 'refs/remotes/origin/main', value: remote, force: true })
+  await git.checkout({ fs: adapter, dir, ref: 'main' })
+  await adapter.promises.writeFile(dir + '/main.tex', 'from local')
+  await adapter.promises.writeFile(dir + '/local-only.tex', 'unrelated local')
+  ;(gitService as any).refreshConflictRemote = async () => {}
+  return { gitService, base, remote }
+}
+
+test('review uses working bytes and applies a merged choice without a remote push', async () => {
+  const { gitService, base, remote } = await conflictFixture()
+  const review = await gitService.getConflictReview()
+  expect(review).toMatchObject({ branch: 'main', localHead: base, remoteHead: remote, files: [{
+    path: 'main.tex', localText: 'from local', remoteText: 'from remote', baseText: 'original',
+    localExists: true, remoteExists: true, isBinary: false,
+  }] })
+  await gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'merged', content: 'both edits' }])
+  expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(remote)
+  expect(await git.currentBranch({ fs: adapter, dir })).toBe('main')
+  expect(await adapter.promises.readFile(dir + '/main.tex', 'utf8')).toBe('both edits')
+  expect(await adapter.promises.readFile(dir + '/remote-only.tex', 'utf8')).toBe('remote addition')
+  expect(await adapter.promises.readFile(dir + '/local-only.tex', 'utf8')).toBe('unrelated local')
+  expect(await git.status({ fs: adapter, dir, filepath: 'main.tex' })).toBe('*modified')
+  expect(await git.status({ fs: adapter, dir, filepath: 'remote-only.tex' })).toBe('unmodified')
+})
+
+test('review fails closed after a draft changes the affected file', async () => {
+  const { gitService, base } = await conflictFixture()
+  const review = await gitService.getConflictReview()
+  await adapter.promises.writeFile(dir + '/main.tex', 'newer draft')
+  await expect(gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'remote' }])).rejects.toThrow('local file changed')
+  expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(base)
+  expect(await adapter.promises.readFile(dir + '/main.tex', 'utf8')).toBe('newer draft')
+  expect(await service.exists(dir + '/remote-only.tex')).toBe(false)
+})
+
+test('review rejects an advanced remote revision before changing the checkout', async () => {
+  const { gitService, base } = await conflictFixture()
+  const review = await gitService.getConflictReview()
+  await git.writeRef({ fs: adapter, dir, ref: 'refs/remotes/origin/main', value: base, force: true })
+  await expect(gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'remote' }])).rejects.toThrow('revision changed')
+  expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(base)
+  expect(await adapter.promises.readFile(dir + '/main.tex', 'utf8')).toBe('from local')
+})
+
+test('review refuses divergent committed history without replacing the checkout', async () => {
+  const { gitService } = await conflictFixture()
+  await git.add({ fs: adapter, dir, filepath: 'main.tex' })
+  const local = await git.commit({ fs: adapter, dir, message: 'divergent local', author: { name: 'Test', email: 'test@example.test' } })
+  await expect(gitService.getConflictReview()).rejects.toThrow('branches diverged')
+  expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(local)
+})
+
+test('a local deletion remains a pending deletion after the local fast-forward', async () => {
+  const { gitService, remote } = await conflictFixture()
+  await adapter.promises.unlink(dir + '/main.tex')
+  expect(await gitService.getChanges()).toContainEqual({ path: 'main.tex', status: 'deleted' })
+  const review = await gitService.getConflictReview()
+  expect(review.files[0]).toMatchObject({ localText: null, localExists: false, remoteText: 'from remote' })
+  await gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'local' }])
+  expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(remote)
+  expect(await service.exists(dir + '/main.tex')).toBe(false)
+  expect(await gitService.getChanges()).toContainEqual({ path: 'main.tex', status: 'deleted' })
+})
+
+test('a failed branch update restores affected worktree bytes and the original index', async () => {
+  const { gitService, base, remote } = await conflictFixture()
+  const review = await gitService.getConflictReview()
+  const originalIndex = await adapter.promises.readFile(dir + '/.git/index')
+  const writeRef = git.writeRef
+  const failingRef = spyOn(git, 'writeRef').mockImplementation(async options => {
+    if (options.ref === 'refs/heads/main' && options.value === remote) throw new Error('simulated branch failure')
+    return writeRef(options)
+  })
+  try {
+    await expect(gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'remote' }])).rejects.toThrow('simulated branch failure')
+  } finally {
+    failingRef.mockRestore()
+  }
+  expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(base)
+  expect(await adapter.promises.readFile(dir + '/main.tex', 'utf8')).toBe('from local')
+  expect(await adapter.promises.readFile(dir + '/local-only.tex', 'utf8')).toBe('unrelated local')
+  expect(await service.exists(dir + '/remote-only.tex')).toBe(false)
+  expect(await adapter.promises.readFile(dir + '/.git/index')).toEqual(originalIndex)
+})
+
+test('binary conflict offers byte-preserving choices and rejects merged text', async () => {
+  const { gitService, remote } = await conflictFixture()
+  const bytes = new Uint8Array([0, 255, 13, 10, 128])
+  await adapter.promises.writeFile(dir + '/main.tex', bytes)
+  const review = await gitService.getConflictReview()
+  expect(review.files[0]).toMatchObject({ isBinary: true, localExists: true, localText: null })
+  await expect(gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'merged', content: 'lossy' }])).rejects.toThrow('valid resolution')
+  await gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'local' }])
+  expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(remote)
+  expect(await adapter.promises.readFile(dir + '/main.tex')).toEqual(bytes)
+})

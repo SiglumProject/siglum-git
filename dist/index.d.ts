@@ -55,5 +55,5 @@
 export { createOPFSGitAdapter, getOPFSGitAdapter } from './OPFSGitAdapter';
 export { createFilesystemGitAdapter, type FilesystemGitAdapter } from './FilesystemGitAdapter';
 export { GitService, getGitService, type GitServiceOptions } from './GitService';
-export type { GitConfig, GitStatus, FileChange, FileItem, GitStatusListener, FileTreeListener, Collaborator, CollaboratorPresence, CollaboratorsListener, BranchDiff, ConflictingFile } from './types';
+export type { GitConfig, GitStatus, FileChange, FileItem, GitStatusListener, FileTreeListener, Collaborator, CollaboratorPresence, CollaboratorsListener, BranchDiff, ConflictingFile, GitConflictReview, GitConflictReviewFile, GitConflictResolution } from './types';
 //# sourceMappingURL=index.d.ts.map
