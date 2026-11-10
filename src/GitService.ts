@@ -1126,7 +1126,10 @@ export class GitService {
             await git.writeRef({ fs: this.fs, dir: GIT_DIR, ref, value: localHead, force: true })
           }
         } catch (rollbackError) {
-          throw new Error('Could not finish or fully restore the local conflict resolution.', { cause: rollbackError })
+          const failure = new Error('Could not finish or fully restore the local conflict resolution.')
+          // Keep the original failure without requiring the ES2022 Error constructor.
+          Object.defineProperty(failure, 'cause', { value: rollbackError, writable: true, configurable: true })
+          throw failure
         }
         throw error
       }

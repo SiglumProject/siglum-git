@@ -452,3 +452,33 @@ test('binary conflict offers byte-preserving choices and rejects merged text', a
   expect(await git.resolveRef({ fs: adapter, dir, ref: 'HEAD' })).toBe(remote)
   expect(await adapter.promises.readFile(dir + '/main.tex')).toEqual(bytes)
 })
+
+
+test('a failed conflict rollback preserves its cause with the ES2020 error contract', async () => {
+  const { gitService, remote } = await conflictFixture()
+  const review = await gitService.getConflictReview()
+  const rollbackError = new Error('simulated restore failure')
+  const writeRef = git.writeRef
+  const writeBytes = (gitService as any).writeConflictBytes.bind(gitService)
+  let restoring = false
+  const branchFailure = spyOn(git, 'writeRef').mockImplementation(async options => {
+    if (options.ref === 'refs/heads/main' && options.value === remote) {
+      restoring = true
+      throw new Error('simulated branch failure')
+    }
+    return writeRef(options)
+  })
+  ;(gitService as any).writeConflictBytes = async (...args: unknown[]) => {
+    if (restoring) throw rollbackError
+    return writeBytes(...args)
+  }
+  try {
+    const failure = await gitService.applyConflictResolution(review.id, [{ path: 'main.tex', choice: 'remote' }]).then(() => null, error => error)
+    expect(failure).toBeInstanceOf(Error)
+    expect(failure.message).toContain('Could not finish or fully restore')
+    expect(failure.cause).toBe(rollbackError)
+    expect(Object.keys(failure)).not.toContain('cause')
+  } finally {
+    branchFailure.mockRestore()
+  }
+})
