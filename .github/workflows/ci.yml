@@ -1,0 +1,32 @@
+name: Git CI
+on:
+  push:
+    branches: [main, performance-optimization]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: git
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: SiglumProject/siglum-filesystem
+          ref: ${{ (github.ref_name == 'performance-optimization' || github.head_ref == 'performance-optimization') && 'performance-optimization' || 'main' }}
+          path: filesystem
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.4'
+      - name: Install isolated matching library sources
+        run: |
+          mkdir -p .ci-workspace
+          node --input-type=module -e "import {writeFileSync} from 'node:fs'; writeFileSync('.ci-workspace/package.json', JSON.stringify({name:'siglum-git-source-ci',private:true,workspaces:['../git','../filesystem']}))"
+          bun install --cwd .ci-workspace --ignore-scripts
+      - run: bun run --cwd filesystem build
+      - run: bun run --cwd git build
+      - run: bun run --cwd git test
